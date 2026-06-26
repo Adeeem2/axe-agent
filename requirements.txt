@@ -3,5 +3,8 @@ mss
 opencv-python
 gymnasium
 pytesseract
-Pillow
+Pillow>=12.0.0
+stable-baselines3
+shimmy
+tensorboard
 
