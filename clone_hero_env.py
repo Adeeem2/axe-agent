@@ -30,11 +30,11 @@ HEALTH_REGION = {
 
 # Note colors in BGR — update these from calibrate.py output
 LANE_COLORS_BGR = {
-    0: (0,   200,  0),    # Green
-    1: (0,   0,    200),  # Red
-    2: (0,   200,  200),  # Yellow
-    3: (200, 0,    0),    # Blue
-    4: (200, 100,  0),    # Orange
+    0: (3,   128,  3),    # Green
+    1: (0,   0,    164),  # Red
+    2: (57,   183,  183),  # Yellow
+    3: (153, 82,    0),    # Blue
+    4: (0, 135,  192),    # Orange
 }
 COLOR_TOLERANCE = 60
 
