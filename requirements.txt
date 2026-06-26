@@ -1,3 +1,7 @@
 pydirectinput
 mss
+opencv-python
+gymnasium
+pytesseract
+Pillow
 
