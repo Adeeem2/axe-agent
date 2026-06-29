@@ -46,11 +46,17 @@ def test_env():
     hit_count  = 0
     miss_count = 0
 
+    fret_names = ["Green", "Red", "Yellow", "Blue", "Orange"]
+
     for i in range(20):
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
 
-        action_name = ["Green", "Red", "Yellow", "Blue", "Orange", "Nothing"][action]
+        # format action as fret mask + strum
+        pressed = [fret_names[j] for j in range(5) if action[j]]
+        action_str = "+".join(pressed) if pressed else "None"
+        if action[5]:
+            action_str += "+Strum"
 
         if reward > 0:
             hit_count += 1
@@ -61,7 +67,7 @@ def test_env():
         else:
             tag = "     ·"
 
-        print(f"  Step {i:>2} | {tag} | Action: {action_name:<7} | Reward: {reward:>6.2f}")
+        print(f"  Step {i:>2} | {tag} | Action: {action_str:<20} | Reward: {reward:>6.2f}")
 
         if terminated:
             print("  Episode ended early (song failed)")

@@ -4,78 +4,32 @@ import numpy as np
 import pydirectinput
 import gymnasium as gym
 from gymnasium import spaces
+import pytesseract
 import time
 import re
-import pytesseract
 
-pytesseract.pytesseract.tesseract_cmd = r'D:\Tesseract-OCR\tesseract.exe'
+from config import (
+    HIGHWAY_REGION, STRIKEBAR_Y, SUSTAIN_LOOKAHEAD_Y,
+    HEALTH_REGION, STATS_REGION,
+    LANE_COLORS_BGR, COLOR_TOLERANCE,
+    LANE_KEYS, STRUM_KEY, REPEAT_KEY, REPEAT_INTERVAL,
+    STATS_READ_INTERVAL,
+)
+
 pydirectinput.PAUSE = 0
 
 # ─────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────
-
-HIGHWAY_REGION = {
-    "top":    300,
-    "left":   430,
-    "width":  500,
-    "height": 400
-}
-
-# Strikebar — where notes must be hit
-STRIKEBAR_Y = 340
-
-# Sustain detection — how far above the strikebar a long note extends
-# If color is detected in this band AND at strikebar → it's a sustain
-SUSTAIN_LOOKAHEAD_Y = 200  # pixels above strikebar to check for sustain tail
-
-HEALTH_REGION = {
-    "top":    50,
-    "left":   200,
-    "width":  400,
-    "height": 20
-}
-
-STATS_REGION = {
-    "top":    193,
-    "left":   828,
-    "width":  195,
-    "height": 147,
-}
-
-LANE_COLORS_BGR = {
-    0: (3,   128,  3),    # Green
-    1: (0,   0,    164),  # Red
-    2: (57,  183,  183),  # Yellow
-    3: (153, 82,   0),    # Blue
-    4: (0,   135,  192),  # Orange
-}
-COLOR_TOLERANCE = 60
-
-LANE_KEYS = {
-    0: 'q',
-    1: 's',
-    2: 'j',
-    3: 'k',
-    4: 'l',
-}
-STRUM_KEY  = 'down'
-REPEAT_KEY = 'h'
-REPEAT_INTERVAL = 300  # 5 minutes
-
-# How often to run OCR stats (every N steps) — expensive so not every step
-STATS_READ_INTERVAL = 200
-
-# ─────────────────────────────────────────────────────────────
-# ACTION SPACE  (11 discrete actions)
+# ACTION SPACE  (MultiDiscrete with 6 binary dimensions)
 #
-#   0–4  → strum lane 0–4  (tap: press + strum + release)
-#   5–9  → hold  lane 0–4  (sustain: keyDown only, no strum)
-#   10   → release all     (end sustain / do nothing)
+#   action[0:5] → fret mask: 0 = release, 1 = press
+#                 lanes 0–4 = Green, Red, Yellow, Blue, Orange
+#   action[5]   → strum:     0 = no, 1 = yes
 #
-# The agent learns: use action 0-4 to hit a note head,
-# use action 5-9 to keep holding during a sustain tail,
-# use action 10 to release when the sustain ends.
+# Examples:
+#   [1,0,0,0,0,1] → press Green + strum                 (single note)
+#   [1,0,1,0,0,1] → press Green + Yellow + strum        (chord)
+#   [1,0,0,0,0,0] → hold Green  (sustain, no strum)
+#   [0,0,0,0,0,0] → release all / do nothing
 # ─────────────────────────────────────────────────────────────
 
 class CloneHeroEnv(gym.Env):
@@ -87,7 +41,7 @@ class CloneHeroEnv(gym.Env):
 
         self.debug = debug
 
-        self.action_space      = spaces.Discrete(11)
+        self.action_space      = spaces.MultiDiscrete([2, 2, 2, 2, 2, 2])
         self.observation_space = spaces.Box(
             low=0, high=255, shape=(84, 84, 1), dtype=np.uint8
         )
@@ -199,29 +153,29 @@ class CloneHeroEnv(gym.Env):
     # ─────────────────────────────────────────────────────────
 
     def _execute_action(self, action):
-        if action <= 4:
-            # STRUM action — tap the note (press + strum + release)
-            # release any held keys first so we don't corrupt the strum
-            self._release_all_keys()
-            key = LANE_KEYS[action]
-            pydirectinput.keyDown(key)
-            pydirectinput.press(STRUM_KEY)
-            pydirectinput.keyUp(key)
+        fret_mask = action[:5]
+        strum     = bool(action[5])
 
-        elif action <= 9:
-            # HOLD action — sustain, keep key down, no strum
-            lane = action - 5
-            key  = LANE_KEYS[lane]
-            if key not in self._held_keys:
+        # release frets the agent no longer wants pressed
+        for lane_idx in range(5):
+            key = LANE_KEYS[lane_idx]
+            if fret_mask[lane_idx] == 0 and key in self._held_keys:
+                pydirectinput.keyUp(key)
+                self._held_keys.discard(key)
+
+        # press frets the agent wants
+        for lane_idx in range(5):
+            key = LANE_KEYS[lane_idx]
+            if fret_mask[lane_idx] == 1 and key not in self._held_keys:
                 pydirectinput.keyDown(key)
                 self._held_keys.add(key)
 
-        else:
-            # action 10 — release everything
-            self._release_all_keys()
+        # strum if desired
+        if strum:
+            pydirectinput.press(STRUM_KEY)
 
     def _release_all_keys(self):
-        for key in LANE_KEYS.values():
+        for key in list(self._held_keys):
             pydirectinput.keyUp(key)
         self._held_keys.clear()
 
@@ -271,40 +225,86 @@ class CloneHeroEnv(gym.Env):
     # ─────────────────────────────────────────────────────────
 
     def _compute_reward(self, action):
-        reward = -0.01  # time penalty
+        reward = -0.01
 
         if self.prev_frame_bgr is None:
             return reward
 
+        fret_mask = action[:5]
+        strummed  = bool(action[5])
+
+        regular_lanes = set()
+        sustain_head  = set()
+        sustain_tail  = set()
+
         for lane_idx in range(5):
-            at_strikebar = self._note_present_in_lane(lane_idx, self.prev_frame_bgr)
+            has_head = self._note_present_in_lane(lane_idx, self.prev_frame_bgr)
+            has_tail = self._sustain_tail_active(lane_idx, self.prev_frame_bgr)
 
-            if not at_strikebar:
-                continue
+            if has_head and not has_tail:
+                regular_lanes.add(lane_idx)
+            elif has_head and has_tail:
+                sustain_head.add(lane_idx)
+            elif has_tail and not has_head:
+                sustain_tail.add(lane_idx)
 
-            is_sustain = self._is_sustain(lane_idx, self.prev_frame_bgr)
+        all_notes = regular_lanes | sustain_head | sustain_tail
 
-            if is_sustain:
-                # sustain note — agent should be holding (action 5-9)
-                hold_action = lane_idx + 5
-                if action == hold_action:
-                    reward += 0.5   # smaller reward per frame for holding
-                    if self.debug:
-                        print(f"  HOLD lane {lane_idx} ✓")
-                else:
-                    reward -= 0.3   # not holding during sustain
-                    if self.debug:
-                        print(f"  HOLD lane {lane_idx} ✗ (agent chose {action})")
+        # ── regular notes: need fret + strum ──
+        for lane_idx in regular_lanes:
+            if fret_mask[lane_idx] and strummed:
+                reward += 1.0
+                if self.debug:
+                    print(f"  HIT  lane {lane_idx} ✓")
             else:
-                # regular note — agent should strum (action 0-4)
-                if action == lane_idx:
-                    reward += 1.0
-                    if self.debug:
-                        print(f"  HIT  lane {lane_idx} ✓")
-                else:
-                    reward -= 0.5
-                    if self.debug:
-                        print(f"  MISS lane {lane_idx} ✗ (agent chose {action})")
+                reward -= 0.5
+                if self.debug:
+                    missing = []
+                    if not fret_mask[lane_idx]:
+                        missing.append("fret not pressed")
+                    if not strummed:
+                        missing.append("not strummed")
+                    print(f"  MISS lane {lane_idx} ✗ ({', '.join(missing)})")
+
+        # ── sustain head at strikebar: need fret + strum to hit ──
+        for lane_idx in sustain_head:
+            if fret_mask[lane_idx] and strummed:
+                reward += 1.0
+                if self.debug:
+                    print(f"  HIT  sustain lane {lane_idx} ✓ (hold through tail)")
+            else:
+                reward -= 0.5
+                if self.debug:
+                    missing = []
+                    if not fret_mask[lane_idx]:
+                        missing.append("fret not pressed")
+                    if not strummed:
+                        missing.append("not strummed")
+                    print(f"  MISS sustain lane {lane_idx} ✗ ({', '.join(missing)})")
+
+        # ── sustain tail active: keep fret held (no strum needed) ──
+        for lane_idx in sustain_tail:
+            if fret_mask[lane_idx]:
+                reward += 0.3
+                if self.debug:
+                    print(f"  HOLD lane {lane_idx} ✓ (sustain tail)")
+            else:
+                reward -= 0.3
+                if self.debug:
+                    print(f"  HOLD lane {lane_idx} ✗ (released during sustain)")
+
+        # ── ghost frets: pressing a lane with no note ──
+        for lane_idx in range(5):
+            if lane_idx not in all_notes and fret_mask[lane_idx]:
+                reward -= 0.2
+                if self.debug:
+                    print(f"  GHOST lane {lane_idx} (pressed with no note)")
+
+        # ── ghost strum: strumming when no regular notes ──
+        if strummed and not regular_lanes and not sustain_head:
+            reward -= 0.1
+            if self.debug:
+                print(f"  GHOST strum (no notes to hit)")
 
         return reward
 
@@ -340,6 +340,27 @@ class CloneHeroEnv(gym.Env):
             )
 
         return result
+
+    def _sustain_tail_active(self, lane_idx, frame_bgr):
+        """Returns True if a sustain tail still has color above the strikebar."""
+        x_start = lane_idx * self.lane_width
+        x_end   = x_start + self.lane_width
+        y_start = max(0, STRIKEBAR_Y - SUSTAIN_LOOKAHEAD_Y)
+        y_end   = STRIKEBAR_Y
+
+        zone = frame_bgr[y_start:y_end, x_start:x_end]
+        if zone.size == 0:
+            return False
+
+        target_bgr = LANE_COLORS_BGR[lane_idx]
+        lower = np.array([max(0,   c - COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
+        upper = np.array([min(255, c + COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
+        mask  = cv2.inRange(zone, lower, upper)
+
+        rows_with_color = np.any(mask > 0, axis=1).sum()
+        total_rows      = zone.shape[0]
+
+        return bool(rows_with_color / total_rows > 0.03)
 
     def _is_sustain(self, lane_idx, frame_bgr):
         """
