@@ -7,19 +7,38 @@ from gymnasium import spaces
 import pytesseract
 import time
 import re
+from collections import deque
+import os
+import sys
 
 from config import (
-    HIGHWAY_REGION, STRIKEBAR_Y, SUSTAIN_LOOKAHEAD_Y,
-    HEALTH_REGION, STATS_REGION,
-    LANE_COLORS_BGR, COLOR_TOLERANCE,
+    HIGHWAY_REGION, HEALTH_REGION, STATS_REGION,
     LANE_KEYS, STRUM_KEY, REPEAT_KEY, REPEAT_INTERVAL,
     STATS_READ_INTERVAL,
+    # New config
+    REWARD_SCORE_SCALE, REWARD_GHOST_PENALTY, REWARD_FAIL_PENALTY,
+    REWARD_SURVIVAL_BONUS, REWARD_HIT_BONUS, REWARD_COMBO_BONUS,
+    OBS_GRAYSCALE, OBS_RESIZE, ACTION_MIN_HOLD_FRAMES,
+    REQUIRE_ADMIN,
 )
+
+# ─────────────────────────────────────────────────────────────
+# ADMIN CHECK (Windows)
+# ─────────────────────────────────────────────────────────────
+def check_admin():
+    """Check if running as administrator on Windows."""
+    if REQUIRE_ADMIN and os.name == 'nt':
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin()
+        except:
+            pass
+    return True
 
 pydirectinput.PAUSE = 0
 
 # ─────────────────────────────────────────────────────────────
-# ACTION SPACE  (MultiDiscrete with 6 binary dimensions)
+# ACTION SPACE  MultiBinary(6)
 #
 #   action[0:5] → fret mask: 0 = release, 1 = press
 #                 lanes 0–4 = Green, Red, Yellow, Blue, Orange
@@ -36,17 +55,25 @@ class CloneHeroEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, debug=False):
+    def __init__(self, debug=False, curriculum_stage=0):
         super().__init__()
 
         self.debug = debug
+        self.curriculum_stage = curriculum_stage
 
-        self.action_space      = spaces.MultiDiscrete([2, 2, 2, 2, 2, 2])
+        # Check admin rights
+        if not check_admin():
+            print("⚠️  WARNING: Not running as Administrator! pydirectinput may not work.")
+            print("   Run your terminal/IDE as Administrator.")
+
+        self.action_space      = spaces.MultiBinary(6)
+        # Observation: 4 stacked frames, RGB or grayscale
+        n_channels = 1 if OBS_GRAYSCALE else 3
         self.observation_space = spaces.Box(
-            low=0, high=255, shape=(84, 84, 1), dtype=np.uint8
+            low=0, high=255, shape=(OBS_RESIZE[1], OBS_RESIZE[0], n_channels * 4), dtype=np.uint8
         )
 
-        self.sct = mss.MSS()  # uppercase — avoids deprecation + random freeze bug
+        self.sct = mss.MSS()
 
         try:
             mon = self.sct.monitors[2]
@@ -72,15 +99,28 @@ class CloneHeroEnv(gym.Env):
             "height": STATS_REGION["height"],
         }
 
-        self.lane_width        = HIGHWAY_REGION["width"] // 5
-        self.prev_frame_bgr    = None
-        self.current_frame_bgr = None
+        # Frame stack
+        self.frame_stack       = deque(maxlen=4)
+
+        # Action tracking with minimum hold frames
+        self._prev_action      = np.zeros(6, dtype=int)
+        self._action_hold_frames = np.zeros(6, dtype=int)  # Track how long each key held
+
+        # Reward tracking
+        self._prev_score       = None
+        self._prev_ghosts      = 0
+        self._prev_hit_percent = 0.0
+        self._prev_combo       = 0
+        self._last_stats       = {}
         self._first_reset      = True
-        self._last_repeat_time = time.time()
-        self._held_keys        = set()   # tracks which keys are currently held down
+        self._held_keys        = set()
         self._step_count       = 0
-        self._prev_ghosts      = 0       # ghost note count from last OCR read
-        self._last_stats       = {}      # most recent parsed stats
+        self._episode_steps    = 0
+        self._total_reward     = 0.0
+
+        # Song management - DISABLED automatic repeat to prevent "stops clicking"
+        # self._last_repeat_time = time.time()
+        # self._song_repeat_enabled = False  # Set True only if you want auto-repeat
 
     # ─────────────────────────────────────────────────────────
     # CORE GYM METHODS
@@ -90,11 +130,17 @@ class CloneHeroEnv(gym.Env):
         super().reset(seed=seed)
 
         self._release_all_keys()
-        self.prev_frame_bgr    = None
-        self.current_frame_bgr = None
-        self._step_count       = 0
-        self._prev_ghosts      = 0
-        self._last_stats       = {}
+        self.frame_stack.clear()
+        self._prev_action = np.zeros(6, dtype=int)
+        self._action_hold_frames = np.zeros(6, dtype=int)
+        self._prev_score  = None
+        self._prev_ghosts = 0
+        self._prev_hit_percent = 0.0
+        self._prev_combo = 0
+        self._last_stats  = {}
+        self._step_count  = 0
+        self._episode_steps = 0
+        self._total_reward = 0.0
 
         if self._first_reset:
             self._first_reset = False
@@ -102,46 +148,86 @@ class CloneHeroEnv(gym.Env):
         else:
             self._restart_song()
 
-        self._last_repeat_time = time.time()
-        obs = self._get_obs()
-        return obs, {}
+        # Fill frame stack with initial frames
+        rgb = self._capture_rgb()
+        for _ in range(4):
+            self.frame_stack.append(rgb)
+
+        return self._build_obs(), {}
 
     def step(self, action):
-        self._maybe_repeat_song()
+        self._episode_steps += 1
+
+        # Execute action with minimum hold frames
         self._execute_action(action)
 
-        obs    = self._get_obs()
-        reward = self._compute_reward(action)
+        # Capture post-action frame and build stacked observation
+        obs = self._get_obs()
 
-        # read OCR stats every STATS_READ_INTERVAL steps
+        # Reward calculation
+        reward = 0.0
         self._step_count += 1
-        if self._step_count % STATS_READ_INTERVAL == 0:
-            self._last_stats = self._read_stats()
-            if self.debug and self._last_stats:
-                print(f"  [stats] {self._last_stats}")
 
-        # ghost note penalty from OCR
-        ghosts = self._last_stats.get("ghosts")
-        if ghosts is not None:
-            ghost_delta = ghosts - self._prev_ghosts
-            if ghost_delta > 0:
-                reward -= ghost_delta * 0.3
-                if self.debug:
-                    print(f"  GHOST x{ghost_delta} penalty")
-            self._prev_ghosts = ghosts
+        # Dense survival bonus
+        reward += REWARD_SURVIVAL_BONUS
+
+        # Read stats periodically
+        if self._step_count % STATS_READ_INTERVAL == 0:
+            stats = self._read_stats()
+            self._last_stats = stats
+
+            # Score increase → positive reward
+            score = stats.get("score")
+            if score is not None and self._prev_score is not None:
+                delta = score - self._prev_score
+                if delta > 0:
+                    reward += delta * REWARD_SCORE_SCALE
+                    if self.debug:
+                        print(f"  SCORE +{delta} → reward +{delta * REWARD_SCORE_SCALE:.2f}")
+
+            # Ghost notes → penalty
+            ghosts = stats.get("ghosts")
+            if ghosts is not None:
+                ghost_delta = ghosts - self._prev_ghosts
+                if ghost_delta > 0:
+                    reward -= ghost_delta * REWARD_GHOST_PENALTY
+                    if self.debug:
+                        print(f"  GHOST x{ghost_delta} penalty")
+
+            # Hit percent improvement bonus
+            hit_percent = stats.get("hit_percent")
+            if hit_percent is not None and self._prev_hit_percent > 0:
+                if hit_percent > self._prev_hit_percent:
+                    reward += (hit_percent - self._prev_hit_percent) * REWARD_HIT_BONUS
+            if hit_percent is not None:
+                self._prev_hit_percent = hit_percent
+
+            # Combo bonus (if available in stats)
+            combo = stats.get("combo", 0)
+            if combo > self._prev_combo:
+                reward += (combo - self._prev_combo) * REWARD_COMBO_BONUS
+                self._prev_combo = combo
+
+            if score is not None:
+                self._prev_score = score
+            if ghosts is not None:
+                self._prev_ghosts = ghosts
 
         song_failed = self._is_song_failed()
         terminated  = song_failed
         truncated   = False
 
         if song_failed:
-            reward -= 10.0
+            reward += REWARD_FAIL_PENALTY
             self._release_all_keys()
 
-        if self.current_frame_bgr is not None:
-            self.prev_frame_bgr = self.current_frame_bgr.copy()
+        self._total_reward += reward
 
-        info = {"stats": self._last_stats}
+        info = {
+            "stats": self._last_stats,
+            "episode_steps": self._episode_steps,
+            "total_reward": self._total_reward,
+        }
         return obs, reward, terminated, truncated, info
 
     def close(self):
@@ -149,35 +235,50 @@ class CloneHeroEnv(gym.Env):
         self.sct.close()
 
     # ─────────────────────────────────────────────────────────
-    # ACTION EXECUTION
+    # ACTION EXECUTION  (diff-based with minimum hold frames)
     # ─────────────────────────────────────────────────────────
 
     def _execute_action(self, action):
-        fret_mask = action[:5]
-        strum     = bool(action[5])
+        """Press/release only keys whose state changed from previous action.
+        Enforces minimum hold frames to prevent rapid toggling."""
+        for i in range(5):
+            key = LANE_KEYS[i]
+            prev = self._prev_action[i]
+            curr = action[i]
 
-        # release frets the agent no longer wants pressed
-        for lane_idx in range(5):
-            key = LANE_KEYS[lane_idx]
-            if fret_mask[lane_idx] == 0 and key in self._held_keys:
-                pydirectinput.keyUp(key)
-                self._held_keys.discard(key)
-
-        # press frets the agent wants
-        for lane_idx in range(5):
-            key = LANE_KEYS[lane_idx]
-            if fret_mask[lane_idx] == 1 and key not in self._held_keys:
+            if curr and not prev:
+                # Press new key
                 pydirectinput.keyDown(key)
                 self._held_keys.add(key)
+                self._action_hold_frames[i] = 1
+            elif curr and prev:
+                # Continue holding - increment hold counter
+                self._action_hold_frames[i] += 1
+            elif not curr and prev:
+                # Release key only if minimum hold frames met
+                if self._action_hold_frames[i] >= ACTION_MIN_HOLD_FRAMES:
+                    pydirectinput.keyUp(key)
+                    self._held_keys.discard(key)
+                    self._action_hold_frames[i] = 0
+                else:
+                    # Not held long enough - keep pressed (override action)
+                    action[i] = 1
+                    self._action_hold_frames[i] += 1
+            else:
+                # Not pressed, not previously pressed
+                self._action_hold_frames[i] = 0
 
-        # strum if desired
-        if strum:
+        # Strum is momentary - press on action[5] == 1
+        if action[5]:
             pydirectinput.press(STRUM_KEY)
+
+        self._prev_action = action.copy()
 
     def _release_all_keys(self):
         for key in list(self._held_keys):
             pydirectinput.keyUp(key)
         self._held_keys.clear()
+        self._action_hold_frames = np.zeros(6, dtype=int)
 
     # ─────────────────────────────────────────────────────────
     # SONG MANAGEMENT
@@ -186,212 +287,70 @@ class CloneHeroEnv(gym.Env):
     def _restart_song(self):
         if self.debug:
             print("  [reset] restarting song via 'h'...")
+        self._release_all_keys()
+        time.sleep(0.2)
         pydirectinput.press(REPEAT_KEY)
-        time.sleep(2.0)
+        time.sleep(2.0)  # Wait for song to load
         if self.debug:
             print("  [reset] song restarted")
 
-    def _maybe_repeat_song(self):
-        now = time.time()
-        if now - self._last_repeat_time >= REPEAT_INTERVAL:
-            if self.debug:
-                print(f"  [repeat] {REPEAT_INTERVAL}s elapsed — pressing 'h'")
-            self._release_all_keys()
-            pydirectinput.press(REPEAT_KEY)
-            time.sleep(2.0)
-            self._last_repeat_time = now
-            self.prev_frame_bgr    = None
+    # DISABLED: Automatic song repeat every 5 minutes was causing "stops clicking"
+    # def _maybe_repeat_song(self):
+    #     now = time.time()
+    #     if now - self._last_repeat_time >= REPEAT_INTERVAL:
+    #         if self.debug:
+    #             print(f"  [repeat] {REPEAT_INTERVAL}s elapsed — pressing 'h'")
+    #         self._release_all_keys()
+    #         pydirectinput.press(REPEAT_KEY)
+    #         time.sleep(2.0)
+    #         self._last_repeat_time = now
+    #         # Song restarted — reset tracking and re-fill frame stack
+    #         self._prev_score = None
+    #         self._prev_ghosts = 0
+    #         self._prev_hit_percent = 0.0
+    #         self._prev_combo = 0
+    #         self.frame_stack.clear()
+    #         rgb = self._capture_rgb()
+    #         for _ in range(4):
+    #             self.frame_stack.append(rgb)
 
     # ─────────────────────────────────────────────────────────
-    # OBSERVATION
+    # OBSERVATION  — 84×84 RGB × 4 stacked frames
     # ─────────────────────────────────────────────────────────
 
-    def _get_obs(self):
+    def _capture_rgb(self):
+        """Capture highway region, return resized RGB or grayscale array."""
         raw       = self.sct.grab(self.highway_monitor)
         frame_bgr = cv2.cvtColor(np.array(raw), cv2.COLOR_BGRA2BGR)
-        self.current_frame_bgr = frame_bgr
 
-        gray    = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+        if OBS_GRAYSCALE:
+            frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            frame = frame[:, :, np.newaxis]  # Add channel dim
+        else:
+            frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        if self.debug:
-            cv2.imwrite("debug_obs.png",   resized)
-            cv2.imwrite("debug_color.png", frame_bgr)
-
-        return np.expand_dims(resized, axis=-1)
-
-    # ─────────────────────────────────────────────────────────
-    # REWARD
-    # ─────────────────────────────────────────────────────────
-
-    def _compute_reward(self, action):
-        reward = -0.01
-
-        if self.prev_frame_bgr is None:
-            return reward
-
-        fret_mask = action[:5]
-        strummed  = bool(action[5])
-
-        regular_lanes = set()
-        sustain_head  = set()
-        sustain_tail  = set()
-
-        for lane_idx in range(5):
-            has_head = self._note_present_in_lane(lane_idx, self.prev_frame_bgr)
-            has_tail = self._sustain_tail_active(lane_idx, self.prev_frame_bgr)
-
-            if has_head and not has_tail:
-                regular_lanes.add(lane_idx)
-            elif has_head and has_tail:
-                sustain_head.add(lane_idx)
-            elif has_tail and not has_head:
-                sustain_tail.add(lane_idx)
-
-        all_notes = regular_lanes | sustain_head | sustain_tail
-
-        # ── regular notes: need fret + strum ──
-        for lane_idx in regular_lanes:
-            if fret_mask[lane_idx] and strummed:
-                reward += 1.0
-                if self.debug:
-                    print(f"  HIT  lane {lane_idx} ✓")
-            else:
-                reward -= 0.5
-                if self.debug:
-                    missing = []
-                    if not fret_mask[lane_idx]:
-                        missing.append("fret not pressed")
-                    if not strummed:
-                        missing.append("not strummed")
-                    print(f"  MISS lane {lane_idx} ✗ ({', '.join(missing)})")
-
-        # ── sustain head at strikebar: need fret + strum to hit ──
-        for lane_idx in sustain_head:
-            if fret_mask[lane_idx] and strummed:
-                reward += 1.0
-                if self.debug:
-                    print(f"  HIT  sustain lane {lane_idx} ✓ (hold through tail)")
-            else:
-                reward -= 0.5
-                if self.debug:
-                    missing = []
-                    if not fret_mask[lane_idx]:
-                        missing.append("fret not pressed")
-                    if not strummed:
-                        missing.append("not strummed")
-                    print(f"  MISS sustain lane {lane_idx} ✗ ({', '.join(missing)})")
-
-        # ── sustain tail active: keep fret held (no strum needed) ──
-        for lane_idx in sustain_tail:
-            if fret_mask[lane_idx]:
-                reward += 0.3
-                if self.debug:
-                    print(f"  HOLD lane {lane_idx} ✓ (sustain tail)")
-            else:
-                reward -= 0.3
-                if self.debug:
-                    print(f"  HOLD lane {lane_idx} ✗ (released during sustain)")
-
-        # ── ghost frets: pressing a lane with no note ──
-        for lane_idx in range(5):
-            if lane_idx not in all_notes and fret_mask[lane_idx]:
-                reward -= 0.2
-                if self.debug:
-                    print(f"  GHOST lane {lane_idx} (pressed with no note)")
-
-        # ── ghost strum: strumming when no regular notes ──
-        if strummed and not regular_lanes and not sustain_head:
-            reward -= 0.1
-            if self.debug:
-                print(f"  GHOST strum (no notes to hit)")
-
-        return reward
-
-    def _note_present_in_lane(self, lane_idx, frame_bgr):
-        """Returns True if note color is in the strikebar zone of this lane."""
-        x_start = lane_idx * self.lane_width
-        x_end   = x_start + self.lane_width
-        y_start = STRIKEBAR_Y
-        y_end   = HIGHWAY_REGION["height"]
-
-        lane_zone  = frame_bgr[y_start:y_end, x_start:x_end]
-        if lane_zone.size == 0:
-            return False
-
-        target_bgr = LANE_COLORS_BGR[lane_idx]
-        lower = np.array([max(0,   c - COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
-        upper = np.array([min(255, c + COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
-        mask  = cv2.inRange(lane_zone, lower, upper)
-
-        ratio = np.count_nonzero(mask) / mask.size
-        result = ratio > 0.05
+        resized = cv2.resize(frame, OBS_RESIZE, interpolation=cv2.INTER_AREA)
 
         if self.debug:
-            mean_color = lane_zone.mean(axis=(0, 1))
-            lane_names = ["Green", "Red", "Yellow", "Blue", "Orange"]
-            print(
-                f"  [strikebar] lane {lane_idx} ({lane_names[lane_idx]})  "
-                f"zone=({x_start}:{x_end}, {y_start}:{y_end})  "
-                f"target=({target_bgr[0]},{target_bgr[1]},{target_bgr[2]})  "
-                f"mean=({int(mean_color[0])},{int(mean_color[1])},{int(mean_color[2])})  "
-                f"match_ratio={ratio:.3f}  "
-                f"→ {'NOTE' if result else 'none'}"
-            )
+            if OBS_GRAYSCALE:
+                cv2.imwrite("debug_obs.png", resized.squeeze())
+            else:
+                cv2.imwrite("debug_color.png", cv2.cvtColor(resized, cv2.COLOR_RGB2BGR))
 
-        return result
+        return resized
 
-    def _sustain_tail_active(self, lane_idx, frame_bgr):
-        """Returns True if a sustain tail still has color above the strikebar."""
-        x_start = lane_idx * self.lane_width
-        x_end   = x_start + self.lane_width
-        y_start = max(0, STRIKEBAR_Y - SUSTAIN_LOOKAHEAD_Y)
-        y_end   = STRIKEBAR_Y
+    def _build_obs(self):
+        """Stack 4 frames into (H, W, C*4)."""
+        return np.concatenate(list(self.frame_stack), axis=-1)
 
-        zone = frame_bgr[y_start:y_end, x_start:x_end]
-        if zone.size == 0:
-            return False
-
-        target_bgr = LANE_COLORS_BGR[lane_idx]
-        lower = np.array([max(0,   c - COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
-        upper = np.array([min(255, c + COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
-        mask  = cv2.inRange(zone, lower, upper)
-
-        rows_with_color = np.any(mask > 0, axis=1).sum()
-        total_rows      = zone.shape[0]
-
-        return bool(rows_with_color / total_rows > 0.03)
-
-    def _is_sustain(self, lane_idx, frame_bgr):
-        """
-        Returns True if this note is a sustain (long note).
-        A sustain has color continuously extending above the strikebar.
-        We check a band from SUSTAIN_LOOKAHEAD_Y to STRIKEBAR_Y.
-        If a significant portion of that band matches the note color → sustain.
-        """
-        x_start = lane_idx * self.lane_width
-        x_end   = x_start + self.lane_width
-        y_start = max(0, STRIKEBAR_Y - SUSTAIN_LOOKAHEAD_Y)
-        y_end   = STRIKEBAR_Y
-
-        sustain_zone = frame_bgr[y_start:y_end, x_start:x_end]
-        if sustain_zone.size == 0:
-            return False
-
-        target_bgr = LANE_COLORS_BGR[lane_idx]
-        lower = np.array([max(0,   c - COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
-        upper = np.array([min(255, c + COLOR_TOLERANCE) for c in target_bgr], dtype=np.uint8)
-        mask  = cv2.inRange(sustain_zone, lower, upper)
-
-        # count rows that have any matching pixels
-        rows_with_color = np.any(mask > 0, axis=1).sum()
-        total_rows      = sustain_zone.shape[0]
-
-        # if more than 30% of rows above strikebar have this color → sustain
-        return bool(rows_with_color / total_rows > 0.30)
+    def _get_obs(self):
+        """Capture frame, push to stack, return stacked observation."""
+        frame = self._capture_rgb()
+        self.frame_stack.append(frame)
+        return self._build_obs()
 
     # ─────────────────────────────────────────────────────────
-    # OCR STATS
+    # OCR STATS  (including score)
     # ─────────────────────────────────────────────────────────
 
     def _read_stats(self):
@@ -410,6 +369,11 @@ class CloneHeroEnv(gym.Env):
             clean = text.replace(" ", "").replace("\n", " ")
 
             stats = {}
+
+            # Score — primary reward signal
+            m = re.search(r"[Ss]core[:\s]*([\d,]+)", clean)
+            if m:
+                stats["score"] = int(m.group(1).replace(",", ""))
 
             m = re.search(r"[Hh]it[Nn]otes[\W_]*(\d+)/(\d+)", clean)
             if m:
@@ -432,6 +396,11 @@ class CloneHeroEnv(gym.Env):
                     stats["nps"] = float(parts[0] + ("." + parts[1] if len(parts) > 1 else ""))
                 except ValueError:
                     pass
+
+            # Try to extract combo if present
+            m = re.search(r"[Cc]ombo[:\s]*(\d+)", clean)
+            if m:
+                stats["combo"] = int(m.group(1))
 
             return stats
 

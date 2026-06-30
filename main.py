@@ -81,12 +81,12 @@ def test_env():
     print(f"  Hits:   {hit_count}")
     print(f"  Misses: {miss_count}")
     print()
-    print("  Check debug_obs.png   → what the agent sees (grayscale 84x84)")
+    print("  Check debug_obs.png   → what the agent sees (grayscale of RGB 84x84)")
     print("  Check debug_color.png → raw color capture of the highway")
+    print(f"  Obs shape: {obs.shape} — 4 stacked RGB frames for motion + color")
     print()
     if hit_count == 0:
-        print("  ⚠  No hits detected — your LANE_COLORS_BGR or STRIKEBAR_Y")
-        print("     in clone_hero_env.py probably needs calibration.")
+        print("  ⚠  No positive rewards detected — check OCR stats region calibration.")
         print("     Run: python calibrate.py")
     else:
         print("  ✓ Env is working. Ready to train.")
@@ -94,15 +94,21 @@ def test_env():
 
 def play(model_path: str):
     from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
+    from train import make_env
 
     print(f"Loading model: {model_path}")
-    env = CloneHeroEnv(debug=False)
+
+    # Create env with same wrapper as training
+    env = DummyVecEnv([make_env(debug=False)])
+    env = VecFrameStack(env, n_stack=4, channels_order="last")
+
     model = PPO.load(model_path, env=env)
 
     print("Switch to Clone Hero NOW — playing in 5 seconds...")
     time.sleep(5)
 
-    obs, _ = env.reset()
+    obs = env.reset()
     episode      = 0
     total_reward = 0.0
 
@@ -111,14 +117,14 @@ def play(model_path: str):
         while True:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, terminated, truncated, _ = env.step(action)
-            total_reward += float(reward)
+            total_reward += float(reward[0])
 
-            if terminated:
+            if terminated[0]:
                 episode += 1
                 print(f"  Episode {episode} finished | Total reward: {total_reward:.1f}")
                 total_reward = 0.0
                 time.sleep(1)
-                obs, _ = env.reset()
+                obs = env.reset()
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:

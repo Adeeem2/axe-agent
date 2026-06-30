@@ -1,29 +1,36 @@
 import os
 import threading
 import time
+import sys
 from datetime import datetime
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from clone_hero_env import CloneHeroEnv
 
+# Import new config
+from config import (
+    SAVE_EVERY_N_STEPS, SAVE_SYNCHRONOUS,
+    CURRICULUM_ENABLED, CURRICULUM_STAGES,
+    USE_VEC_FRAME_STACK, N_FRAME_STACK,
+    REWARD_SCORE_SCALE, REWARD_GHOST_PENALTY, REWARD_FAIL_PENALTY,
+    REWARD_SURVIVAL_BONUS, REWARD_HIT_BONUS, REWARD_COMBO_BONUS,
+)
 
 # ─────────────────────────────────────────────────────────────
 # SAVE + PROGRESS CALLBACK
 # ─────────────────────────────────────────────────────────────
 
-SAVE_EVERY_N_STEPS = 4096
-
-
 class VerboseCheckpointCallback(BaseCallback):
 
-    def __init__(self, save_every: int, save_path: str, name_prefix: str):
+    def __init__(self, save_every: int, save_path: str, name_prefix: str, synchronous: bool = True):
         super().__init__()
         self.save_every   = save_every
         self.save_path    = save_path
         self.name_prefix  = name_prefix
         self.last_save_at = 0
+        self.synchronous  = synchronous
 
         # reward tracking
         self.episode_rewards  = []
@@ -58,20 +65,73 @@ class VerboseCheckpointCallback(BaseCallback):
 
             self.current_reward = 0.0
 
-        # checkpoint save in background thread so env keeps running
+        # checkpoint save
         if step - self.last_save_at >= self.save_every:
             filename = f"{self.name_prefix}_{step}_steps"
             filepath = os.path.join(self.save_path, filename)
-            threading.Thread(
-                target=self.model.save,
-                args=(filepath,),
-                daemon=True
-            ).start()
+
+            if self.synchronous:
+                # Save in main thread - safer for pydirectinput
+                self.model.save(filepath)
+                print(f"\n{'─'*55}")
+                print(f"  CHECKPOINT SAVED  step {step:,}")
+                print(f"  → models/{filename}.zip")
+                print(f"{'─'*55}\n")
+            else:
+                # Background thread (original behavior)
+                threading.Thread(
+                    target=self.model.save,
+                    args=(filepath,),
+                    daemon=True
+                ).start()
+                self.last_save_at = step
+                print(f"\n{'─'*55}")
+                print(f"  CHECKPOINT SAVED  step {step:,} (background)")
+                print(f"  → models/{filename}.zip")
+                print(f"{'─'*55}\n")
+
             self.last_save_at = step
-            print(f"\n{'─'*55}")
-            print(f"  CHECKPOINT SAVED  step {step:,}")
-            print(f"  → models/{filename}.zip")
-            print(f"{'─'*55}\n")
+
+        return True
+
+
+# ─────────────────────────────────────────────────────────────
+# CURRICULUM CALLBACK
+# ─────────────────────────────────────────────────────────────
+
+class CurriculumCallback(BaseCallback):
+    """Adjust environment difficulty based on training progress."""
+
+    def __init__(self, curriculum_stages, env):
+        super().__init__()
+        self.stages = curriculum_stages
+        self.env = env
+        self.current_stage = 0
+        self.stage_start_step = 0
+
+    def _on_step(self) -> bool:
+        if not CURRICULUM_ENABLED:
+            return True
+
+        step = self.num_timesteps
+
+        # Check if we should advance to next stage
+        if self.current_stage < len(self.stages) - 1:
+            current_stage_config = self.stages[self.current_stage]
+            min_steps = current_stage_config.get("min_steps", 0)
+
+            if step - self.stage_start_step >= min_steps:
+                # Check if performance is good enough to advance
+                # (could add performance check here)
+                self.current_stage += 1
+                self.stage_start_step = step
+                new_stage = self.stages[self.current_stage]
+                print(f"\n{'='*55}")
+                print(f"  CURRICULUM: Advancing to stage '{new_stage['name']}'")
+                print(f"  NPS range: {new_stage['min_nps']} - {new_stage['max_nps']}")
+                print(f"{'='*55}\n")
+                # Note: In practice, you'd need to change the song/chart here
+                # This is a placeholder for curriculum logic
 
         return True
 
@@ -79,6 +139,13 @@ class VerboseCheckpointCallback(BaseCallback):
 # ─────────────────────────────────────────────────────────────
 # TRAIN
 # ─────────────────────────────────────────────────────────────
+
+def make_env(debug=False, curriculum_stage=0):
+    """Factory function for creating env (needed for VecEnv)."""
+    def _init():
+        return Monitor(CloneHeroEnv(debug=debug, curriculum_stage=curriculum_stage))
+    return _init
+
 
 def train(resume_from: str = None):
     print("Please launch Clone Hero and navigate to the song.")
@@ -89,8 +156,13 @@ def train(resume_from: str = None):
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs",   exist_ok=True)
 
-    # Wrap in Monitor then DummyVecEnv — SB3 works best with VecEnv
-    env = DummyVecEnv([lambda: Monitor(CloneHeroEnv(debug=False))])
+    # Create vectorized environment
+    env = DummyVecEnv([make_env(debug=False, curriculum_stage=0)])
+
+    # Apply VecFrameStack for proper frame stacking (replaces manual deque)
+    if USE_VEC_FRAME_STACK:
+        env = VecFrameStack(env, n_stack=N_FRAME_STACK, channels_order="last")
+        print(f"Using VecFrameStack with {N_FRAME_STACK} frames")
 
     if resume_from:
         # ── resume from checkpoint ────────────────────────────
@@ -111,25 +183,36 @@ def train(resume_from: str = None):
             gae_lambda=0.95,
             clip_range=0.2,
             ent_coef=0.01,      # encourages exploration — important early on
-            tensorboard_log="./logs/"
+            tensorboard_log="./logs/",
+            # Better hyperparameters for this task
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            normalize_advantage=True,
         )
         print("Fresh model created.\n")
 
     callback = VerboseCheckpointCallback(
         save_every  = SAVE_EVERY_N_STEPS,
         save_path   = "./models/",
-        name_prefix = "ppo_clonehero"
+        name_prefix = "ppo_clonehero",
+        synchronous = SAVE_SYNCHRONOUS,
     )
+
+    # Add curriculum callback if enabled
+    callbacks = [callback]
+    if CURRICULUM_ENABLED:
+        callbacks.append(CurriculumCallback(CURRICULUM_STAGES, env))
 
     run_name = f"PPO_v1_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     print(f"Training started — saving every {SAVE_EVERY_N_STEPS:,} steps")
+    print(f"Synchronous save: {SAVE_SYNCHRONOUS}")
     print(f"Tensorboard: tensorboard --logdir ./logs/\n")
 
     try:
         model.learn(
             total_timesteps  = 500_000,
-            callback         = callback,
+            callback         = callbacks,
             tb_log_name      = run_name,
             log_interval     = 99999,   # silence SB3 table — our callback handles it
             reset_num_timesteps = not bool(resume_from)
@@ -146,7 +229,6 @@ def train(resume_from: str = None):
 
 
 if __name__ == "__main__":
-    import sys
 
     # Usage:
     #   python train.py                                      ← fresh run

@@ -9,15 +9,15 @@ HIGHWAY_REGION = {
     "height": 400,
 }
 
-STRIKEBAR_Y = 340
+STRIKEBAR_Y = 300
 
 SUSTAIN_LOOKAHEAD_Y = 200
 
 HEALTH_REGION = {
-    "top":    50,
-    "left":   200,
-    "width":  400,
-    "height": 20,
+    "top":    526,   # Y position (second number)
+    "left":   1041,  # X position (first number)
+    "width":  112,
+    "height": 20
 }
 
 STATS_REGION = {
@@ -50,3 +50,42 @@ REPEAT_KEY = 'h'
 REPEAT_INTERVAL = 300
 
 STATS_READ_INTERVAL = 200
+
+# ─────────────────────────────────────────────────────────────
+# NEW: Training improvements
+# ─────────────────────────────────────────────────────────────
+
+# Frame stacking - use SB3's VecFrameStack instead of manual deque
+USE_VEC_FRAME_STACK = True
+N_FRAME_STACK = 4
+
+# Reward shaping
+REWARD_SCORE_SCALE = 0.002      # per score point
+REWARD_GHOST_PENALTY = 0.3      # per ghost note
+REWARD_FAIL_PENALTY = -10.0     # song failure
+REWARD_SURVIVAL_BONUS = 0.001   # per step alive (dense reward)
+REWARD_HIT_BONUS = 0.05         # bonus when hit% improves
+REWARD_COMBO_BONUS = 0.01       # per combo milestone
+
+# Curriculum learning
+CURRICULUM_ENABLED = True
+CURRICULUM_STAGES = [
+    {"name": "easy",     "min_nps": 0,   "max_nps": 3.0, "min_steps": 50000},
+    {"name": "medium",   "min_nps": 3.0, "max_nps": 6.0, "min_steps": 100000},
+    {"name": "hard",     "min_nps": 6.0, "max_nps": 10.0, "min_steps": 200000},
+    {"name": "expert",   "min_nps": 10.0, "max_nps": 999, "min_steps": 500000},
+]
+
+# Checkpoint saving - synchronous to avoid pydirectinput thread issues
+SAVE_EVERY_N_STEPS = 4096
+SAVE_SYNCHRONOUS = True  # Set True to save in main thread (safer for pydirectinput)
+
+# Admin check
+REQUIRE_ADMIN = True
+
+# Observation preprocessing
+OBS_GRAYSCALE = False  # Keep RGB for color info (lane colors)
+OBS_RESIZE = (84, 84)
+
+# Action smoothing - prevent rapid toggle
+ACTION_MIN_HOLD_FRAMES = 2  # Minimum frames to hold a key before release
