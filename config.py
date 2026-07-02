@@ -1,7 +1,3 @@
-import pytesseract
-
-pytesseract.pytesseract.tesseract_cmd = r'D:\Tesseract-OCR\tesseract.exe'
-
 HIGHWAY_REGION = {
     "top":    300,
     "left":   430,
@@ -9,23 +5,38 @@ HIGHWAY_REGION = {
     "height": 400,
 }
 
-STRIKEBAR_Y = 300
+STRIKEBAR_Y = 340
 
 SUSTAIN_LOOKAHEAD_Y = 200
 
-HEALTH_REGION = {
-    "top":    526,   # Y position (second number)
-    "left":   1041,  # X position (first number)
-    "width":  112,
-    "height": 20
+# Thin strip right at the strumbar — relative to monitor origin, same as other regions.
+# Derived from HIGHWAY_REGION + STRIKEBAR_Y so it always stays aligned.
+HIT_ZONE_REGION = {
+    "top":    HIGHWAY_REGION["top"]  + STRIKEBAR_Y - 15,  # centred on strikebar
+    "left":   HIGHWAY_REGION["left"],
+    "width":  HIGHWAY_REGION["width"],
+    "height": 30,
 }
 
-STATS_REGION = {
-    "top":    193,
-    "left":   828,
-    "width":  195,
-    "height": 147,
+# Region above the hitzone for detecting approaching notes (not yet at strum bar).
+# Placed NOTE_ABOVE_OFFSET pixels above the hitzone so colors are read before
+# they reach the hitzone, preventing false-positive note-present detections.
+NOTE_ABOVE_OFFSET = 48
+NOTE_DETECTION_REGION = {
+    "top":    HIT_ZONE_REGION["top"] - NOTE_ABOVE_OFFSET,
+    "left":   HIT_ZONE_REGION["left"] ,
+    "width":  HIT_ZONE_REGION["width"] - 25,
+    "height": 40,
 }
+
+# New reward values (replace the old ones)
+REWARD_HIT          =  1.0   # correct fret + strum on note
+REWARD_MISS_STRUM   = -0.3   # strummed with no note, or wrong timing
+REWARD_WRONG_FRET   = -0.5   # note present but pressed wrong fret
+REWARD_SUSTAIN_HOLD =  0.1   # holding correct fret during sustain tail
+REWARD_SURVIVAL_BONUS = 0.0  # set to 0 — we don't want "do nothing" to be safe
+REWARD_FAIL_PENALTY = -2.0
+
 
 LANE_COLORS_BGR = {
     0: (3,   128,  3),
@@ -77,7 +88,7 @@ CURRICULUM_STAGES = [
 ]
 
 # Checkpoint saving - synchronous to avoid pydirectinput thread issues
-SAVE_EVERY_N_STEPS = 4096
+SAVE_EVERY_N_STEPS = 20000
 SAVE_SYNCHRONOUS = True  # Set True to save in main thread (safer for pydirectinput)
 
 # Admin check
@@ -86,6 +97,22 @@ REQUIRE_ADMIN = True
 # Observation preprocessing
 OBS_GRAYSCALE = False  # Keep RGB for color info (lane colors)
 OBS_RESIZE = (84, 84)
+
+# ─────────────────────────────────────────────────────────────
+# NEW: CloneHero Specific Tuning (from monolithic env)
+# ─────────────────────────────────────────────────────────────
+
+# HSV COLOUR RANGES (one per fret lane)
+FRET_HSV = [
+    ((37,56,65), (82,255,255)),  # 0 Green
+    ((0,39,46), (18,255,188)),  # 1 Red
+    ((27,39,46), (52,255,188)),  # 2 Yellow
+    ((92,39,46), (109,255,188)),  # 3 Blue
+    ((11,24,48), (26,255,221)),  # 4 Orange
+]
+
+# Minimum fraction of hit-zone pixels that must be lit for a HIT confirmation
+HIT_PIXEL_THRESHOLD = 0.08
 
 # Action smoothing - prevent rapid toggle
 ACTION_MIN_HOLD_FRAMES = 2  # Minimum frames to hold a key before release
